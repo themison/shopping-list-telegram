@@ -11,6 +11,9 @@ if not BOT_TOKEN:
 # Путь к базе данных
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot_database.db")
 
+# Имя пользователя бота
+BOT_USERNAME = os.getenv("BOT_USERNAME", "grocery_list_rotor_bot")
+
 # Максимальная длина названия списка/элемента
 MAX_NAME_LENGTH = 100
 

@@ -1,18 +1,15 @@
 import sqlite3
-import os
 from contextlib import contextmanager
 from datetime import datetime
-from config import DATABASE_PATH, ROLE_OWNER, ROLE_EDITOR
+from config import DATABASE_PATH
 
 
 @contextmanager
 def get_db_connection():
-    """Контекстный менеджер для работы с базой данных"""
     conn = None
     try:
-        # Создаем соединение с базой данных
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        conn.row_factory = sqlite3.Row  # Позволяет обращаться к полям по имени
+        conn.row_factory = sqlite3.Row
         yield conn
     except Exception as e:
         if conn:
@@ -24,11 +21,9 @@ def get_db_connection():
 
 
 def init_db():
-    """Инициализация базы данных"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        # Создание таблиц
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -59,7 +54,6 @@ def init_db():
                 list_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 quantity INTEGER DEFAULT 1,
-                completed BOOLEAN DEFAULT FALSE,
                 added_by INTEGER NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (list_id) REFERENCES shopping_lists (id),
@@ -83,11 +77,26 @@ def init_db():
         """
         )
 
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT UNIQUE NOT NULL,
+                list_id INTEGER NOT NULL,
+                owner_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                used BOOLEAN DEFAULT FALSE,
+                expires_at TIMESTAMP DEFAULT (datetime('now', '+7 days')),
+                FOREIGN KEY (list_id) REFERENCES shopping_lists (id),
+                FOREIGN KEY (owner_id) REFERENCES users (id)
+            )
+        """
+        )
+
         conn.commit()
 
 
 def create_user(telegram_id):
-    """Создание нового пользователя"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -98,14 +107,12 @@ def create_user(telegram_id):
         )
         conn.commit()
 
-        # Получаем ID созданного или существующего пользователя
         cursor.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
         result = cursor.fetchone()
         return result["id"] if result else None
 
 
 def update_user_activity(telegram_id):
-    """Обновление времени последней активности пользователя"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -118,7 +125,6 @@ def update_user_activity(telegram_id):
 
 
 def get_user_lists(user_id):
-    """Получение всех списков пользователя"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -136,7 +142,6 @@ def get_user_lists(user_id):
 
 
 def create_list(name, owner_id):
-    """Создание нового списка покупок"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -147,7 +152,6 @@ def create_list(name, owner_id):
         )
         list_id = cursor.lastrowid
 
-        # Владелец автоматически получает доступ
         cursor.execute(
             """
             INSERT INTO list_access (user_id, list_id, role) VALUES (?, ?, ?)
@@ -160,10 +164,8 @@ def create_list(name, owner_id):
 
 
 def delete_list(list_id, user_id):
-    """Удаление списка покупок (только владелец может удалить)"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        # Проверяем, что пользователь является владельцем
         cursor.execute(
             """
             SELECT owner_id FROM shopping_lists WHERE id = ?
@@ -173,7 +175,6 @@ def delete_list(list_id, user_id):
         result = cursor.fetchone()
 
         if result and result["owner_id"] == user_id:
-            # Удаляем список, элементы и доступы
             cursor.execute("DELETE FROM items WHERE list_id = ?", (list_id,))
             cursor.execute("DELETE FROM list_access WHERE list_id = ?", (list_id,))
             cursor.execute("DELETE FROM shopping_lists WHERE id = ?", (list_id,))
@@ -183,7 +184,6 @@ def delete_list(list_id, user_id):
 
 
 def get_list_details(list_id, user_id):
-    """Получение деталей списка (если у пользователя есть доступ)"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -200,12 +200,11 @@ def get_list_details(list_id, user_id):
 
 
 def get_list_items(list_id):
-    """Получение всех элементов списка"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, name, quantity, completed 
+            SELECT id, name, quantity 
             FROM items 
             WHERE list_id = ? 
             ORDER BY created_at
@@ -216,22 +215,19 @@ def get_list_items(list_id):
 
 
 def add_item_to_list(list_id, item_name, quantity, user_id):
-    """Добавление элемента в список"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        # Проверяем, существует ли уже такой элемент
         cursor.execute(
             """
             SELECT id, quantity FROM items 
-            WHERE list_id = ? AND name = ? AND completed = 0
+            WHERE list_id = ? AND name = ?
         """,
             (list_id, item_name),
         )
         existing_item = cursor.fetchone()
 
         if existing_item:
-            # Если элемент уже существует, увеличиваем количество
             new_quantity = existing_item["quantity"] + quantity
             cursor.execute(
                 """
@@ -240,7 +236,6 @@ def add_item_to_list(list_id, item_name, quantity, user_id):
                 (new_quantity, existing_item["id"]),
             )
         else:
-            # Создаем новый элемент
             cursor.execute(
                 """
                 INSERT INTO items (list_id, name, quantity, added_by) 
@@ -252,43 +247,24 @@ def add_item_to_list(list_id, item_name, quantity, user_id):
         conn.commit()
 
 
-def toggle_item_completed(item_id, completed):
-    """Переключение статуса выполнения элемента"""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            UPDATE items SET completed = ? WHERE id = ?
-        """,
-            (completed, item_id),
-        )
-        conn.commit()
-
-
 def delete_item(item_id):
-    """Удаление элемента из списка"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM items WHERE id = ?", (item_id,))
         conn.commit()
 
 
-def clear_completed_items(list_id):
-    """Удаление всех выполненных элементов из списка"""
+def clear_list_items(list_id):
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "DELETE FROM items WHERE list_id = ? AND completed = 1", (list_id,)
-        )
+        cursor.execute("DELETE FROM items WHERE list_id = ?", (list_id,))
         conn.commit()
 
 
 def invite_user_to_list(list_id, user_telegram_id, inviter_id):
-    """Приглашение пользователя в список"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        # Проверяем, что приглашающий имеет доступ к списку
         cursor.execute(
             """
             SELECT sl.owner_id FROM shopping_lists sl
@@ -301,7 +277,6 @@ def invite_user_to_list(list_id, user_telegram_id, inviter_id):
         if not cursor.fetchone():
             return False, "У вас нет доступа к этому списку"
 
-        # Получаем ID пользователя по telegram_id
         cursor.execute(
             "SELECT id FROM users WHERE telegram_id = ?", (user_telegram_id,)
         )
@@ -312,7 +287,6 @@ def invite_user_to_list(list_id, user_telegram_id, inviter_id):
 
         user_id = user_result["id"]
 
-        # Проверяем, не приглашен ли уже пользователь
         cursor.execute(
             """
             SELECT id FROM list_access WHERE user_id = ? AND list_id = ?
@@ -323,7 +297,6 @@ def invite_user_to_list(list_id, user_telegram_id, inviter_id):
         if cursor.fetchone():
             return False, "Пользователь уже имеет доступ к списку"
 
-        # Добавляем пользователя в список
         cursor.execute(
             """
             INSERT INTO list_access (user_id, list_id, role) VALUES (?, ?, ?)
@@ -336,7 +309,6 @@ def invite_user_to_list(list_id, user_telegram_id, inviter_id):
 
 
 def get_list_owner(list_id):
-    """Получение владельца списка"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -349,3 +321,78 @@ def get_list_owner(list_id):
         )
         result = cursor.fetchone()
         return result["telegram_id"] if result else None
+
+
+def save_invite_token(token, list_id, owner_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO invites (token, list_id, owner_id) VALUES (?, ?, ?)
+        """,
+            (token, list_id, owner_id),
+        )
+        conn.commit()
+
+
+def get_invite_by_token(token):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT list_id, owner_id FROM invites 
+            WHERE token = ? AND used = 0 AND expires_at > datetime('now')
+        """,
+            (token,),
+        )
+        return cursor.fetchone()
+
+
+def mark_invite_used(token):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE invites SET used = 1 WHERE token = ?
+        """,
+            (token,),
+        )
+        conn.commit()
+
+
+def invite_user_to_list_as_admin(list_id, user_telegram_id, inviter_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT id FROM users WHERE telegram_id = ?", (user_telegram_id,)
+        )
+        user_result = cursor.fetchone()
+
+        if not user_result:
+            cursor.execute(
+                "INSERT INTO users (telegram_id) VALUES (?)", (user_telegram_id,)
+            )
+            user_id = cursor.lastrowid
+        else:
+            user_id = user_result["id"]
+
+        cursor.execute(
+            """
+            SELECT id FROM list_access WHERE user_id = ? AND list_id = ?
+        """,
+            (user_id, list_id),
+        )
+
+        if cursor.fetchone():
+            return False, "Пользователь уже имеет доступ к списку"
+
+        cursor.execute(
+            """
+            INSERT INTO list_access (user_id, list_id, role) VALUES (?, ?, ?)
+        """,
+            (user_id, list_id, "owner"),
+        )
+
+        conn.commit()
+        return True, "Пользователь успешно приглашен как администратор"

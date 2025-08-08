@@ -1,22 +1,57 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+import uuid
+import hashlib
 from database import *
 from utils import parse_items, format_items_list, format_lists_menu
 from config import *
 
-# Состояния для диалогов
 USER_STATES = {}
+USER_CURRENT_LISTS = {}
 
 STATE_WAITING_FOR_LIST_NAME = "waiting_for_list_name"
 STATE_WAITING_FOR_ITEMS = "waiting_for_items"
 STATE_WAITING_FOR_INVITE = "waiting_for_invite"
 STATE_SELECTING_LIST = "selecting_list"
+STATE_CONTINUOUS_ADDING = "continuous_adding"
+
+
+def generate_invite_token(list_id, owner_id):
+    data = f"{list_id}_{owner_id}_{uuid.uuid4()}"
+    token = hashlib.md5(data.encode()).hexdigest()[:16]
+    return token
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
     user_id = create_user(update.effective_user.id)
     update_user_activity(update.effective_user.id)
+
+    if context.args:
+        token = context.args[0] if len(context.args) > 0 else None
+        if token:
+            invite_data = get_invite_by_token(token)
+            if invite_data:
+                list_id = invite_data["list_id"]
+                owner_id = invite_data["owner_id"]
+
+                success, message = invite_user_to_list_as_admin(
+                    list_id, update.effective_user.id, owner_id
+                )
+
+                if success:
+                    USER_CURRENT_LISTS[update.effective_user.id] = list_id
+                    await update.message.reply_text(
+                        f"🎉 Вы успешно присоединились к списку!\n\n"
+                        f"Теперь вы являетесь администратором этого списка.\n"
+                        f"Вы можете добавлять/удалять элементы и приглашать других пользователей."
+                    )
+                    await show_current_list_menu(update, user_id, list_id)
+                    return
+                else:
+                    await update.message.reply_text(
+                        f"Ошибка при подключении к списку: {message}"
+                    )
+                    return
 
     welcome_text = (
         "🛒 Добро пожаловать в бота для списков покупок!\n\n"
@@ -31,7 +66,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /help"""
     help_text = (
         "🛒 Помощь по боту списков покупок:\n\n"
         "*Работа со списками:*\n"
@@ -43,9 +77,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Работа с элементами:*\n"
         "/items - открыть меню работы с элементами\n"
         "• Добавить элементы (в любом формате)\n"
-        "• Отметить купленные элементы\n"
         "• Удалить элементы\n"
-        "• Очистить купленные элементы\n\n"
+        "• Очистить список\n\n"
         "*Формат добавления элементов:*\n"
         "Поддерживаются различные разделители:\n"
         "запятая, точка с запятой, вертикальная черта,\n"
@@ -61,19 +94,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def lists_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /lists"""
     user_id = create_user(update.effective_user.id)
     update_user_activity(update.effective_user.id)
 
-    # Получаем все списки пользователя
     lists = get_user_lists(user_id)
 
     keyboard = [
         [InlineKeyboardButton("➕ Создать новый список", callback_data="create_list")],
     ]
 
-    # Добавляем кнопки для каждого списка
-    for i, lst in enumerate(lists):
+    for lst in lists:
         role_icon = "👑" if lst["user_role"] == "owner" else "👥"
         keyboard.append(
             [
@@ -94,39 +124,32 @@ async def lists_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def items_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /items"""
     user_id = create_user(update.effective_user.id)
     update_user_activity(update.effective_user.id)
 
-    # Получаем текущий список пользователя из контекста или БД
-    current_list_id = context.user_data.get("current_list_id")
+    current_list_id = USER_CURRENT_LISTS.get(user_id)
 
     if not current_list_id:
-        # Пытаемся получить последний активный список
         lists = get_user_lists(user_id)
         if lists:
             current_list_id = lists[0]["id"]
-            context.user_data["current_list_id"] = current_list_id
+            USER_CURRENT_LISTS[user_id] = current_list_id
         else:
             await update.message.reply_text(
                 "У вас нет активных списков. Создайте новый с помощью /lists"
             )
             return
 
-    # Получаем детали списка
     list_details = get_list_details(current_list_id, user_id)
     if not list_details:
         await update.message.reply_text("Список не найден или у вас нет к нему доступа")
         return
 
-    # Получаем элементы списка
     items = get_list_items(current_list_id)
 
-    # Формируем текст сообщения
     message_text = f"*Список: {list_details['name']}*\n\n"
     message_text += format_items_list(items)
 
-    # Создаем клавиатуру
     keyboard = [
         [
             InlineKeyboardButton(
@@ -135,19 +158,13 @@ async def items_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton(
-                "✅ Отметить купленным",
-                callback_data=f"mark_completed_{current_list_id}",
+                "🗑 Удалить элементы",
+                callback_data=f"delete_items_{current_list_id}_page_0",
             )
         ],
         [
             InlineKeyboardButton(
-                "🗑 Удалить элементы", callback_data=f"delete_items_{current_list_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🧹 Очистить купленные",
-                callback_data=f"clear_completed_{current_list_id}",
+                "🧨 Очистить список", callback_data=f"clear_list_{current_list_id}"
             )
         ],
         [
@@ -168,7 +185,6 @@ async def items_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатий на кнопки"""
     query = update.callback_query
     await query.answer()
 
@@ -183,9 +199,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("select_list_"):
         list_id = int(data.split("_")[2])
-        context.user_data["current_list_id"] = list_id
+        USER_CURRENT_LISTS[user_id] = list_id
 
-        # Получаем элементы списка
         items = get_list_items(list_id)
         list_details = get_list_details(list_id, user_id)
 
@@ -201,19 +216,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ],
                 [
                     InlineKeyboardButton(
-                        "✅ Отметить купленным",
-                        callback_data=f"mark_completed_{list_id}",
+                        "🗑 Удалить элементы",
+                        callback_data=f"delete_items_{list_id}_page_0",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        "🗑 Удалить элементы", callback_data=f"delete_items_{list_id}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🧹 Очистить купленные",
-                        callback_data=f"clear_completed_{list_id}",
+                        "🧨 Очистить список", callback_data=f"clear_list_{list_id}"
                     )
                 ],
                 [
@@ -240,129 +249,83 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("add_items_"):
         list_id = int(data.split("_")[2])
-        context.user_data["current_list_id"] = list_id
-        USER_STATES[user_id] = STATE_WAITING_FOR_ITEMS
-        await query.edit_message_text(
-            "Введите элементы для добавления (в любом формате):"
-        )
+        USER_CURRENT_LISTS[user_id] = list_id
+        USER_STATES[user_id] = STATE_CONTINUOUS_ADDING
 
-    elif data.startswith("mark_completed_"):
-        list_id = int(data.split("_")[2])
-        context.user_data["current_list_id"] = list_id
-
-        # Получаем невыполненные элементы
-        items = get_list_items(list_id)
-        pending_items = [item for item in items if not item["completed"]]
-
-        if not pending_items:
-            await query.edit_message_text("Нет элементов для отметки как купленные")
-            return
-
-        keyboard = []
-        for item in pending_items:
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        f"✅ {item['name']}"
-                        + (f" x{item['quantity']}" if item["quantity"] > 1 else ""),
-                        callback_data=f"complete_item_{item['id']}",
-                    )
-                ]
-            )
-
-        keyboard.append(
-            [InlineKeyboardButton("⬅️ Назад", callback_data=f"back_to_items_{list_id}")]
-        )
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "Выберите элементы для отметки как купленные:", reply_markup=reply_markup
-        )
-
-    elif data.startswith("complete_item_"):
-        item_id = int(data.split("_")[2])
-        toggle_item_completed(item_id, True)
-
-        # Возвращаемся к списку элементов
-        list_id = context.user_data.get("current_list_id")
-        if list_id:
-            items = get_list_items(list_id)
-            list_details = get_list_details(list_id, user_id)
-
-            message_text = f"*Список: {list_details['name']}*\n\n"
-            message_text += format_items_list(items)
-
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "➕ Добавить элементы", callback_data=f"add_items_{list_id}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "✅ Отметить купленным",
-                        callback_data=f"mark_completed_{list_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🗑 Удалить элементы", callback_data=f"delete_items_{list_id}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🧹 Очистить купленные",
-                        callback_data=f"clear_completed_{list_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "👥 Пригласить пользователя",
-                        callback_data=f"invite_user_{list_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔄 Сменить список", callback_data="change_list"
-                    )
-                ],
-                [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "🚪 Выйти из режима добавления",
+                    callback_data=f"exit_adding_{list_id}",
+                )
             ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-            reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "Введите элементы для добавления (в любом формате).\n"
+            "Вы останетесь в режиме добавления до тех пор, пока не введете другую команду "
+            "или не нажмете кнопку 'Выйти из режима добавления'.",
+            reply_markup=reply_markup,
+        )
 
-            await query.edit_message_text(
-                message_text, reply_markup=reply_markup, parse_mode="Markdown"
-            )
+    elif data.startswith("exit_adding_"):
+        list_id = int(data.split("_")[2])
+        USER_CURRENT_LISTS[user_id] = list_id
+        if user_id in USER_STATES:
+            del USER_STATES[user_id]
+        await show_items_list(query, user_id, list_id)
 
     elif data.startswith("delete_items_"):
-        list_id = int(data.split("_")[2])
-        context.user_data["current_list_id"] = list_id
+        parts = data.split("_")
+        list_id = int(parts[2])
+        page = int(parts[4]) if len(parts) > 4 else 0
 
-        # Получаем все элементы
-        items = get_list_items(list_id)
+        USER_CURRENT_LISTS[user_id] = list_id
 
-        if not items:
+        all_items = get_list_items(list_id)
+        total_items = len(all_items)
+        start_idx = page * ITEMS_PER_PAGE
+        end_idx = start_idx + ITEMS_PER_PAGE
+        items_page = all_items[start_idx:end_idx]
+
+        if not items_page:
             await query.edit_message_text("Список пуст")
             return
 
         keyboard = []
-        for item in items:
-            status = "✅" if item["completed"] else "⭕"
+        for item in items_page:
             keyboard.append(
                 [
                     InlineKeyboardButton(
-                        f"{status} {item['name']}"
+                        f"🗑 {item['name']}"
                         + (f" x{item['quantity']}" if item["quantity"] > 1 else ""),
-                        callback_data=f"delete_item_{item['id']}",
+                        callback_data=f"delete_single_item_{item['id']}",
                     )
                 ]
             )
 
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(
+                InlineKeyboardButton(
+                    "⬅️ Назад", callback_data=f"delete_items_{list_id}_page_{page-1}"
+                )
+            )
+        if end_idx < total_items:
+            nav_buttons.append(
+                InlineKeyboardButton(
+                    "➡️ Далее", callback_data=f"delete_items_{list_id}_page_{page+1}"
+                )
+            )
+
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "🗑 Удалить всё", callback_data=f"delete_all_{list_id}"
+                    "🧨 Удалить всё", callback_data=f"delete_all_{list_id}"
                 )
             ]
         )
@@ -372,220 +335,60 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            "Выберите элементы для удаления:", reply_markup=reply_markup
+            f"Выберите элементы для удаления (страница {page+1}):\n"
+            f"Показано {len(items_page)} из {total_items}",
+            reply_markup=reply_markup,
         )
 
-    elif data.startswith("delete_item_"):
-        item_id = int(data.split("_")[2])
+    elif data.startswith("delete_single_item_"):
+        item_id = int(data.split("_")[3])
         delete_item(item_id)
 
-        # Возвращаемся к списку элементов
-        list_id = context.user_data.get("current_list_id")
+        list_id = USER_CURRENT_LISTS.get(user_id)
         if list_id:
-            items = get_list_items(list_id)
-            list_details = get_list_details(list_id, user_id)
-
-            message_text = f"*Список: {list_details['name']}*\n\n"
-            message_text += format_items_list(items)
-
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "➕ Добавить элементы", callback_data=f"add_items_{list_id}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "✅ Отметить купленным",
-                        callback_data=f"mark_completed_{list_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🗑 Удалить элементы", callback_data=f"delete_items_{list_id}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🧹 Очистить купленные",
-                        callback_data=f"clear_completed_{list_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "👥 Пригласить пользователя",
-                        callback_data=f"invite_user_{list_id}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔄 Сменить список", callback_data="change_list"
-                    )
-                ],
-                [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
-            ]
-
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            await query.edit_message_text(
-                message_text, reply_markup=reply_markup, parse_mode="Markdown"
-            )
+            await show_items_list(query, user_id, list_id)
 
     elif data.startswith("delete_all_"):
         list_id = int(data.split("_")[2])
-        # Удаляем все элементы
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM items WHERE list_id = ?", (list_id,))
             conn.commit()
 
-        # Возвращаемся к списку элементов
-        items = get_list_items(list_id)
-        list_details = get_list_details(list_id, user_id)
+        await show_items_list(query, user_id, list_id)
 
-        message_text = f"*Список: {list_details['name']}*\n\n"
-        message_text += format_items_list(items)
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "➕ Добавить элементы", callback_data=f"add_items_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "✅ Отметить купленным", callback_data=f"mark_completed_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🗑 Удалить элементы", callback_data=f"delete_items_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🧹 Очистить купленные", callback_data=f"clear_completed_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "👥 Пригласить пользователя", callback_data=f"invite_user_{list_id}"
-                )
-            ],
-            [InlineKeyboardButton("🔄 Сменить список", callback_data="change_list")],
-            [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
-        ]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.edit_message_text(
-            message_text, reply_markup=reply_markup, parse_mode="Markdown"
-        )
-
-    elif data.startswith("clear_completed_"):
+    elif data.startswith("clear_list_"):
         list_id = int(data.split("_")[2])
-        clear_completed_items(list_id)
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM items WHERE list_id = ?", (list_id,))
+            conn.commit()
 
-        # Возвращаемся к списку элементов
-        items = get_list_items(list_id)
-        list_details = get_list_details(list_id, user_id)
-
-        message_text = f"*Список: {list_details['name']}*\n\n"
-        message_text += format_items_list(items)
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "➕ Добавить элементы", callback_data=f"add_items_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "✅ Отметить купленным", callback_data=f"mark_completed_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🗑 Удалить элементы", callback_data=f"delete_items_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🧹 Очистить купленные", callback_data=f"clear_completed_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "👥 Пригласить пользователя", callback_data=f"invite_user_{list_id}"
-                )
-            ],
-            [InlineKeyboardButton("🔄 Сменить список", callback_data="change_list")],
-            [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
-        ]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.edit_message_text(
-            message_text, reply_markup=reply_markup, parse_mode="Markdown"
-        )
+        await show_items_list(query, user_id, list_id)
 
     elif data.startswith("invite_user_"):
         list_id = int(data.split("_")[2])
-        context.user_data["current_list_id"] = list_id
-        USER_STATES[user_id] = STATE_WAITING_FOR_INVITE
+        USER_CURRENT_LISTS[user_id] = list_id
+
+        token = generate_invite_token(list_id, user_id)
+        save_invite_token(token, list_id, user_id)
+
+        invite_link = f"https://t.me/{BOT_USERNAME}?start={token}"
+
         await query.edit_message_text(
-            "Введите Telegram ID пользователя для приглашения:\n"
-            "(Его можно узнать через @userinfobot)"
+            f"🔗 Ссылка для приглашения в список:\n\n"
+            f"`{invite_link}`\n\n"
+            f"Отправьте эту ссылку тому, кого хотите пригласить.\n"
+            f"Приглашенный пользователь станет администратором списка!",
+            parse_mode="Markdown",
         )
 
     elif data.startswith("back_to_items_"):
         list_id = int(data.split("_")[3])
-        context.user_data["current_list_id"] = list_id
-
-        items = get_list_items(list_id)
-        list_details = get_list_details(list_id, user_id)
-
-        message_text = f"*Список: {list_details['name']}*\n\n"
-        message_text += format_items_list(items)
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "➕ Добавить элементы", callback_data=f"add_items_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "✅ Отметить купленным", callback_data=f"mark_completed_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🗑 Удалить элементы", callback_data=f"delete_items_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🧹 Очистить купленные", callback_data=f"clear_completed_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "👥 Пригласить пользователя", callback_data=f"invite_user_{list_id}"
-                )
-            ],
-            [InlineKeyboardButton("🔄 Сменить список", callback_data="change_list")],
-            [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
-        ]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.edit_message_text(
-            message_text, reply_markup=reply_markup, parse_mode="Markdown"
-        )
+        USER_CURRENT_LISTS[user_id] = list_id
+        await show_items_list(query, user_id, list_id)
 
     elif data == "change_list":
-        # Показываем меню выбора списка
         lists = get_user_lists(user_id)
 
         keyboard = []
@@ -618,15 +421,61 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Неизвестная команда")
 
 
+async def show_items_list(query, user_id, list_id):
+    items = get_list_items(list_id)
+    list_details = get_list_details(list_id, user_id)
+
+    message_text = f"*Список: {list_details['name']}*\n\n"
+    message_text += format_items_list(items)
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "➕ Добавить элементы", callback_data=f"add_items_{list_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🗑 Удалить элементы", callback_data=f"delete_items_{list_id}_page_0"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🧨 Очистить список", callback_data=f"clear_list_{list_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 Пригласить пользователя", callback_data=f"invite_user_{list_id}"
+            )
+        ],
+        [InlineKeyboardButton("🔄 Сменить список", callback_data="change_list")],
+        [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        message_text, reply_markup=reply_markup, parse_mode="Markdown"
+    )
+
+
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений"""
     user_id = create_user(update.effective_user.id)
     update_user_activity(update.effective_user.id)
 
     user_state = USER_STATES.get(user_id)
 
+    if update.message.text.startswith("/"):
+        if user_state == STATE_CONTINUOUS_ADDING:
+            del USER_STATES[user_id]
+
     if user_state == STATE_WAITING_FOR_LIST_NAME:
-        # Создаем новый список
+        if update.message.text.lower() in ["отмена", "cancel", "/cancel"]:
+            del USER_STATES[user_id]
+            await update.message.reply_text("Создание списка отменено.")
+            return
+
         list_name = update.message.text.strip()
         if not list_name:
             await update.message.reply_text(
@@ -635,63 +484,74 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         list_id = create_list(list_name, user_id)
-        context.user_data["current_list_id"] = list_id
+        USER_CURRENT_LISTS[user_id] = list_id
         del USER_STATES[user_id]
 
         await update.message.reply_text(f"Список '{list_name}' успешно создан!")
 
-        # Показываем меню элементов
-        items = get_list_items(list_id)
-        list_details = get_list_details(list_id, user_id)
+        await show_current_list_menu(update, user_id, list_id)
 
-        message_text = f"*Список: {list_details['name']}*\n\n"
-        message_text += format_items_list(items)
+    elif user_state == STATE_CONTINUOUS_ADDING:
+        current_list_id = USER_CURRENT_LISTS.get(user_id)
+        if not current_list_id:
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "🚪 Выйти из режима добавления",
+                        callback_data=f"exit_adding_{current_list_id or 0}",
+                    )
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(
+                "Ошибка: не выбран список", reply_markup=reply_markup
+            )
+            del USER_STATES[user_id]
+            return
+
+        items_to_add = parse_items(update.message.text)
+
+        if not items_to_add:
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "🚪 Выйти из режима добавления",
+                        callback_data=f"exit_adding_{current_list_id}",
+                    )
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(
+                "Не удалось распознать элементы.", reply_markup=reply_markup
+            )
+            return
+
+        for item_name, quantity in items_to_add:
+            add_item_to_list(current_list_id, item_name, quantity, user_id)
 
         keyboard = [
             [
                 InlineKeyboardButton(
-                    "➕ Добавить элементы", callback_data=f"add_items_{list_id}"
+                    "🚪 Выйти из режима добавления",
+                    callback_data=f"exit_adding_{current_list_id}",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    "✅ Отметить купленным", callback_data=f"mark_completed_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🗑 Удалить элементы", callback_data=f"delete_items_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🧹 Очистить купленные", callback_data=f"clear_completed_{list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "👥 Пригласить пользователя", callback_data=f"invite_user_{list_id}"
-                )
-            ],
-            [InlineKeyboardButton("🔄 Сменить список", callback_data="change_list")],
-            [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
+            ]
         ]
-
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await update.message.reply_text(
-            message_text, reply_markup=reply_markup, parse_mode="Markdown"
+            f"Добавлено элементов: {len(items_to_add)}", reply_markup=reply_markup
         )
 
     elif user_state == STATE_WAITING_FOR_ITEMS:
-        # Добавляем элементы в список
-        current_list_id = context.user_data.get("current_list_id")
+        current_list_id = USER_CURRENT_LISTS.get(user_id)
         if not current_list_id:
             await update.message.reply_text("Ошибка: не выбран список")
             del USER_STATES[user_id]
             return
 
-        # Парсим элементы
         items_to_add = parse_items(update.message.text)
 
         if not items_to_add:
@@ -700,63 +560,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Добавляем элементы в базу данных
         for item_name, quantity in items_to_add:
             add_item_to_list(current_list_id, item_name, quantity, user_id)
 
         del USER_STATES[user_id]
 
-        # Показываем обновленный список
-        items = get_list_items(current_list_id)
-        list_details = get_list_details(current_list_id, user_id)
-
-        message_text = f"*Список: {list_details['name']}*\n\n"
-        message_text += format_items_list(items)
-        message_text += f"\n\nДобавлено элементов: {len(items_to_add)}"
-
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "➕ Добавить еще", callback_data=f"add_items_{current_list_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "✅ Отметить купленным",
-                    callback_data=f"mark_completed_{current_list_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🗑 Удалить элементы",
-                    callback_data=f"delete_items_{current_list_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🧹 Очистить купленные",
-                    callback_data=f"clear_completed_{current_list_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "👥 Пригласить пользователя",
-                    callback_data=f"invite_user_{current_list_id}",
-                )
-            ],
-            [InlineKeyboardButton("🔄 Сменить список", callback_data="change_list")],
-            [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
-        ]
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            message_text, reply_markup=reply_markup, parse_mode="Markdown"
-        )
+        await show_current_list_menu(update, user_id, current_list_id)
 
     elif user_state == STATE_WAITING_FOR_INVITE:
-        # Приглашаем пользователя в список
-        current_list_id = context.user_data.get("current_list_id")
+        current_list_id = USER_CURRENT_LISTS.get(user_id)
         if not current_list_id:
             await update.message.reply_text("Ошибка: не выбран список")
             del USER_STATES[user_id]
@@ -788,51 +600,63 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(message)
 
     else:
-        # Обычное текстовое сообщение
-        await update.message.reply_text(
-            "Не понимаю команду. Используйте /help для получения справки."
+        if update.message.text.startswith("/"):
+            command = update.message.text.split()[0]
+            if command == "/lists":
+                await lists_command(update, context)
+            elif command == "/items":
+                await items_command(update, context)
+            elif command == "/help":
+                await help_command(update, context)
+            elif command == "/start":
+                await start_command(update, context)
+            else:
+                await update.message.reply_text(
+                    "Не понимаю команду. Используйте /help для получения справки."
+                )
+        else:
+            pass
+
+
+async def show_current_list_menu(update, user_id, list_id):
+    items = get_list_items(list_id)
+    list_details = get_list_details(list_id, user_id)
+
+    message_text = f"*Список: {list_details['name']}*\n\n"
+    message_text += format_items_list(items)
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "➕ Добавить элементы", callback_data=f"add_items_{list_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🗑 Удалить элементы", callback_data=f"delete_items_{list_id}_page_0"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🧨 Очистить список", callback_data=f"clear_list_{list_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 Пригласить пользователя", callback_data=f"invite_user_{list_id}"
+            )
+        ],
+        [InlineKeyboardButton("🔄 Сменить список", callback_data="change_list")],
+        [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if hasattr(update, "callback_query") and update.callback_query:
+        await update.callback_query.edit_message_text(
+            message_text, reply_markup=reply_markup, parse_mode="Markdown"
         )
-
-
-async def handle_start_with_params(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик /start с параметрами для принятия приглашения"""
-    user_id = create_user(update.effective_user.id)
-    update_user_activity(update.effective_user.id)
-
-    # Проверяем наличие параметров
-    if not context.args or len(context.args) < 2:
-        # Обычный старт
-        await start_command(update, context)
-        return
-
-    try:
-        list_id = int(context.args[0])
-        owner_telegram_id = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("Неверная ссылка приглашения")
-        return
-
-    # Проверяем, что пользователь не является владельцем
-    owner_id_result = None
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id FROM users WHERE telegram_id = ?", (owner_telegram_id,)
-        )
-        result = cursor.fetchone()
-        owner_id_result = result["id"] if result else None
-
-    if not owner_id_result or owner_id_result == user_id:
-        await update.message.reply_text("Неверная ссылка приглашения")
-        return
-
-    # Пробуем добавить пользователя в список
-    success, message = invite_user_to_list(
-        list_id, update.effective_user.id, owner_id_result
-    )
-
-    if success:
-        await update.message.reply_text("Вы успешно присоединились к списку!")
-        context.user_data["current_list_id"] = list_id
     else:
-        await update.message.reply_text(f"Ошибка: {message}")
+        await update.message.reply_text(
+            message_text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
