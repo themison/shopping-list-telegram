@@ -1,0 +1,30 @@
+# Shopping List Bot
+
+**Attention**: This code was generated with Qwen3 through multiple iterations. This is iteration 6, which represents the most refined version of the implementation.
+
+A simple Telegram bot for managing shopping lists with friends.
+
+## Features
+- Create and manage multiple shopping lists
+- Add items in various formats (comma, semicolon, new lines, etc.)
+- Invite friends to collaborate on lists
+- Delete items individually or clear entire lists
+- Pagination for easy navigation
+- Continuous item adding mode
+
+## Setup
+1. Clone the repository
+2. Install dependencies: `pip install -r requirements.txt`
+3. Create `.env` file with your bot token:
+   ```
+   BOT_TOKEN=your_telegram_bot_token_here
+   DATABASE_PATH=bot_database.db
+   BOT_USERNAME=your_bot_username
+   ```
+4. Run the bot: `python bot.py`
+
+## Usage
+- `/start` - Start the bot
+- `/lists` - Manage lists
+- `/items` - Work with list items
+- `/help` - Get help
