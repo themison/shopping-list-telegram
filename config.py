@@ -26,3 +26,6 @@ COMMAND_START = "/start"
 COMMAND_LISTS = "/lists"
 COMMAND_ITEMS = "/items"
 COMMAND_HELP = "/help"
+
+
+ITEMS_PER_PAGE = 10
